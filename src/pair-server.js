@@ -5,7 +5,7 @@ const dgram = require('dgram');
 const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
-const { PAIR_HTTP_PORT, BEACON_UDP_PORT, MAGIC, TEMP_FW_RULE } = require('./config');
+const { PAIR_HTTP_PORT, BEACON_UDP_PORT, MAGIC, TEMP_FW_RULE, PAIR_CODE_ROTATE_MS } = require('./config');
 const { run } = require('./exec');
 const log = require('./log');
 const { validatePubKey, fingerprint, authFilePaths, removeByFingerprints } = require('./keymgr');
@@ -17,8 +17,11 @@ const FP_RE = /^SHA256:[A-Za-z0-9+/]{43}$/;
 
 /** 服务器端配对服务：HTTP 配对 + UDP 广播信标 + 临时防火墙规则 */
 class PairServer {
-  constructor() {
+  constructor({ rotateMs } = {}) {
     this.code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+    this.session = null;
+    this.rotateMs = rotateMs || PAIR_CODE_ROTATE_MS;
+    this.rotateTimer = null;
     this.httpServer = null;
     this.beaconSocket = null;
     this.beaconTimer = null;
@@ -36,6 +39,7 @@ class PairServer {
     this.startHttp();
     this.startBeacon();
     this.addFirewall();
+    this.rotateTimer = setInterval(() => this.rotateTimed(), this.rotateMs);
   }
 
   startHttp() {
@@ -85,6 +89,46 @@ class PairServer {
     return false;
   }
 
+  /** 生成新配对码并重显在屏幕（reason: 'used' 使用后轮换 / 'timer' 定时轮换） */
+  newCode(reason) {
+    this.code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+    log.plain('');
+    const codeText = `${log.c.green}${log.c.bold}${this.displayCode()}${log.c.reset}`;
+    if (reason === 'timer') {
+      const mins = Math.round(this.rotateMs / 60000);
+      const period = mins >= 1 ? `每 ${mins} 分钟` : `每 ${Math.round(this.rotateMs / 1000)} 秒`;
+      log.info(`配对码定时更新：${codeText} ← ${period}自动轮换，旧码作废；下一位客户端请使用新码`);
+    } else {
+      log.info(`配对码已更新：${codeText} ← 一次性使用，旧码已作废；下一位客户端请使用新码`);
+    }
+  }
+
+  /** 配对码校验通过即消耗：换码 + 签发后续清理请求所用的会话令牌 */
+  consumeCode() {
+    this.newCode('used');
+    this.session = {
+      token: crypto.randomBytes(24).toString('hex'),
+      expires: Date.now() + 10 * 60 * 1000,
+    };
+    return this.session.token;
+  }
+
+  /** 定时轮换：仅换码，不影响已签发的会话令牌 */
+  rotateTimed() {
+    this.newCode('timer');
+  }
+
+  /** 清理等后续请求的会话令牌校验（10 分钟有效，仅最新一次配对持有） */
+  checkSession(req, res) {
+    const token = String(req.headers['x-session-token'] || '').trim();
+    const valid = this.session && token === this.session.token && Date.now() < this.session.expires;
+    if (!valid) {
+      log.warn(`会话令牌无效或已过期（来自 ${req.socket.remoteAddress}）`);
+      this.failJson(res, 403, '会话令牌无效或已过期，请重新配对');
+    }
+    return valid;
+  }
+
   failJson(res, code, msg) {
     try {
       res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -102,7 +146,11 @@ class PairServer {
       }
       if (!this.checkCode(req, res)) return;
       if (this.busy) return this.failJson(res, 409, '服务器正在处理另一个配对请求，请稍后重试');
-      if (!validatePubKey(payload.pubkey || '')) return this.failJson(res, 400, '公钥格式不正确');
+      // 配对码一次性使用：校验通过即轮换并签发会话令牌（后续清理请求凭令牌鉴权）
+      const sessionToken = this.consumeCode();
+      if (!validatePubKey(payload.pubkey || '')) {
+        return this.failJson(res, 400, '公钥格式不正确（本次配对码已消耗，请使用服务器屏幕上的新配对码重试）');
+      }
 
       const clientHost = String(payload.clientHostname || 'unknown');
       log.info(`客户端 ${clientHost}（${req.socket.remoteAddress}）配对成功，开始部署...`);
@@ -153,6 +201,7 @@ class PairServer {
           },
           staleKeys: (r.staleKeys || []).map((s) => ({ fingerprint: s.fingerprint, algo: s.algo, comment: s.comment })),
           audit: audit ? { ok: audit.ok, failures: audit.failures, warnings: audit.warnings } : null,
+          sessionToken,
         });
         res.end();
         if (r.ok) log.ok(`部署与体检完成，已通知客户端 ${clientHost}。可继续等待其他客户端，Ctrl+C 退出`);
@@ -178,7 +227,7 @@ class PairServer {
       } catch {
         return this.failJson(res, 400, '请求体不是合法 JSON');
       }
-      if (!this.checkCode(req, res)) return;
+      if (!this.checkSession(req, res)) return;
       if (this.busy) return this.failJson(res, 409, '服务器正在处理另一个请求，请稍后重试');
       const fps = Array.isArray(payload.fingerprints) ? payload.fingerprints : [];
       if (!fps.length) return this.failJson(res, 400, 'fingerprints 不能为空');
@@ -262,6 +311,7 @@ class PairServer {
   stop() {
     if (this.stopped) return;
     this.stopped = true;
+    if (this.rotateTimer) clearInterval(this.rotateTimer);
     if (this.beaconTimer) clearInterval(this.beaconTimer);
     try { if (this.beaconSocket) this.beaconSocket.close(); } catch { /* 忽略 */ }
     try { if (this.httpServer) this.httpServer.close(); } catch { /* 忽略 */ }

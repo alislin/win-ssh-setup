@@ -309,7 +309,7 @@ async function roleServer() {
   log.plain('');
   log.plain(`  ${c.bold}══ 等待客户端连接 ══${c.reset}`);
   log.plain(`  本机地址 : ${c.cyan}${ips.length ? ips.join('  ') : '未检测到局域网 IP（可让客户端手动输入主机名）'}${c.reset}   端口 : ${PAIR_HTTP_PORT}`);
-  log.plain(`  配对码   : ${c.green}${c.bold}${server.displayCode()}${c.reset}   ← 请在客户端输入这串数字`);
+  log.plain(`  配对码   : ${c.green}${c.bold}${server.displayCode()}${c.reset}   ← 每 5 分钟自动轮换，配对成功后立即更新`);
   log.plain('  客户端配对后：自动部署 → 配置体检（无连接）→ 可选实测；按 Ctrl+C 退出（自动清理临时防火墙规则）');
   log.plain('');
 
@@ -333,28 +333,47 @@ async function roleClient() {
   log.ok(`使用公钥：${pub.pubPath}${pub.reused ? '（已有密钥）' : ''}`);
 
   log.info('正在搜索同一网络中等待配对的服务器（约 5 秒）...');
-  const list = await discover(5000);
   let target = null;
-  if (list.length) {
-    log.plain('  发现以下服务器：');
-    list.forEach((s, i) => log.plain(`   [${i + 1}] ${s.hostname}  (${s.ip})`));
-    log.plain('   [m] 手动输入 IP');
-    const pick = (await ask(`请选择 [1-${list.length}] 或 m: `)).trim().toLowerCase();
-    if (pick === 'm') {
-      target = await askAddress();
-    } else {
+  let cancelled = false;
+  for (;;) {
+    const list = await discover(5000);
+    if (list.length) {
+      log.plain('  发现以下服务器：');
+      list.forEach((s, i) => log.plain(`   [${i + 1}] ${s.hostname}  (${s.ip})`));
+      const pick = (await ask(`请选择 [1-${list.length}]，或 [r] 重新扫描 / [m] 手动输入 IP / [0] 返回菜单: `)).trim().toLowerCase();
+      if (pick === 'r') {
+        log.info('正在重新扫描...');
+        continue;
+      }
+      if (pick === '0' || pick === 'q') { cancelled = true; break; }
+      if (pick === 'm') {
+        target = await askAddress();
+        if (!target) continue;
+        break;
+      }
       const idx = parseInt(pick, 10);
       if (!idx || idx < 1 || idx > list.length) {
-        log.warn('已取消');
-        return;
+        log.warn('输入无效，请重试');
+        continue;
       }
       target = { host: list[idx - 1].ip, port: list[idx - 1].httpPort };
+      break;
     }
-  } else {
-    log.warn('未自动发现服务器（可能被路由器/AP 隔离或防火墙拦截广播），请手动输入');
-    target = await askAddress();
+    log.warn('未自动发现服务器（可能被路由器/AP 隔离、广播被拦截，或服务器尚未启动）');
+    const pick = (await ask('请选择: [r] 重新扫描 / [m] 手动输入 IP / [0] 返回菜单: ')).trim().toLowerCase();
+    if (pick === 'r') {
+      log.info('正在重新扫描...');
+      continue;
+    }
+    if (pick === '0' || pick === 'q') { cancelled = true; break; }
+    if (pick === 'm' || pick === '') {
+      target = await askAddress();
+      if (!target) continue;
+      break;
+    }
+    log.warn('输入无效，请重试');
   }
-  if (!target) return;
+  if (cancelled || !target) return;
 
   let code = null;
   for (let i = 0; i < 3; i++) {
@@ -387,8 +406,8 @@ async function roleClient() {
   log.ok(`服务器 ${done.serverHostname} 部署完成，目标用户：${done.serverUser}`);
   printAuditSummary(done.audit);
 
-  // 更换 key 场景：清理服务器上的同主机旧公钥
-  if (done.staleKeys && done.staleKeys.length) {
+  // 更换 key 场景：清理服务器上的同主机旧公钥（凭配对签发的会话令牌鉴权）
+  if (done.sessionToken && done.staleKeys && done.staleKeys.length) {
     log.plain(`  ${c.yellow}检测到本机旧公钥 ${done.staleKeys.length} 个（更换密钥后残留）：${c.reset}`);
     for (const s of done.staleKeys) log.plain(`   - ${s.fingerprint}  ${s.comment}`);
     const ans = await ask('是否清理上述旧公钥？[Y/n]: ');
@@ -396,7 +415,7 @@ async function roleClient() {
       try {
         const r = await cleanup({
           ...target,
-          code,
+          sessionToken: done.sessionToken,
           fingerprints: done.staleKeys.map((s) => s.fingerprint),
           keepFingerprint: fingerprintOf(pub.pubKey),
           onStep: (s) => log.step(s),

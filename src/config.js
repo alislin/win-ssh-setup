@@ -10,4 +10,6 @@ module.exports = {
   MAGIC: 'WIN-SSH-SETUP-BEACON',
   /** 临时防火墙规则名（服务器端配对端口），退出时删除 */
   TEMP_FW_RULE: 'win-ssh-setup-pair-tmp',
+  /** 配对码定时轮换间隔（毫秒）：使用后立即轮换，未使用也定时轮换 */
+  PAIR_CODE_ROTATE_MS: 5 * 60 * 1000,
 };

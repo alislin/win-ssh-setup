@@ -35,20 +35,23 @@ function discover(timeoutMs = 5000) {
 
 /**
  * 发送 POST 请求并流式消费 NDJSON 响应（step/audit 实时回调，done 汇总返回）。
+ * 鉴权：配对请求传 code（X-Pair-Code），后续请求传 sessionToken（X-Session-Token）。
  * @returns {Promise<{type:'done', ...}>}
  */
-function postNdjson({ host, port, urlPath, code, body, onStep, timeoutMs = 180 * 1000 }) {
+function postNdjson({ host, port, urlPath, code, sessionToken, body, onStep, timeoutMs = 180 * 1000 }) {
   return new Promise((resolve, reject) => {
+    const headers = {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(body),
+    };
+    if (code) headers['X-Pair-Code'] = code;
+    if (sessionToken) headers['X-Session-Token'] = sessionToken;
     const req = http.request({
       host,
       port: port || PAIR_HTTP_PORT,
       path: urlPath,
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(body),
-        'X-Pair-Code': code,
-      },
+      headers,
     }, (res) => {
       if (res.statusCode !== 200) {
         let buf = '';
@@ -103,13 +106,13 @@ function submit({ host, port, code, pubKey, onStep }) {
   });
 }
 
-/** 清理服务器上的旧公钥（按指纹） */
-function cleanup({ host, port, code, fingerprints, keepFingerprint, onStep }) {
+/** 清理服务器上的旧公钥（按指纹，凭配对成功后签发的会话令牌鉴权） */
+function cleanup({ host, port, sessionToken, fingerprints, keepFingerprint, onStep }) {
   return postNdjson({
     host,
     port,
     urlPath: '/pair/cleanup',
-    code,
+    sessionToken,
     body: JSON.stringify({ fingerprints, keepFingerprint }),
     onStep,
     timeoutMs: 60 * 1000,
