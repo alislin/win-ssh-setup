@@ -333,10 +333,10 @@ async function roleClient() {
   log.ok(`使用公钥：${pub.pubPath}${pub.reused ? '（已有密钥）' : ''}`);
 
   let done = null;
+  let target = null;
   let skipDiscovery = false;
   outer: for (;;) {
     // —— 选择目标：自动发现（可重扫）或手动输 IP ——
-    let target = null;
     if (!skipDiscovery) {
       log.info('正在搜索同一网络中等待配对的服务器（约 5 秒）...');
       for (;;) {
