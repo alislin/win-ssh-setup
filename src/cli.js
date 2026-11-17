@@ -12,7 +12,7 @@ const install = require('./install');
 const { runDeploy } = require('./deploy');
 const { runAudit, runFix } = require('./audit');
 const { PairServer } = require('./pair-server');
-const { discover, submit, cleanup } = require('./pair-client');
+const { discover, submit, cleanup, preflightTcp } = require('./pair-client');
 const { verifyPasswordless } = require('./verify');
 const { resolveTool } = require('./exec');
 const { userInfo } = require('./env');
@@ -332,71 +332,90 @@ async function roleClient() {
   const pub = await ensurePubKey();
   log.ok(`使用公钥：${pub.pubPath}${pub.reused ? '（已有密钥）' : ''}`);
 
-  log.info('正在搜索同一网络中等待配对的服务器（约 5 秒）...');
-  let target = null;
-  let cancelled = false;
-  for (;;) {
-    const list = await discover(5000);
-    if (list.length) {
-      log.plain('  发现以下服务器：');
-      list.forEach((s, i) => log.plain(`   [${i + 1}] ${s.hostname}  (${s.ip})`));
-      const pick = (await ask(`请选择 [1-${list.length}]，或 [r] 重新扫描 / [m] 手动输入 IP / [0] 返回菜单: `)).trim().toLowerCase();
-      if (pick === 'r') {
-        log.info('正在重新扫描...');
-        continue;
-      }
-      if (pick === '0' || pick === 'q') { cancelled = true; break; }
-      if (pick === 'm') {
-        target = await askAddress();
-        if (!target) continue;
-        break;
-      }
-      const idx = parseInt(pick, 10);
-      if (!idx || idx < 1 || idx > list.length) {
+  let done = null;
+  let skipDiscovery = false;
+  outer: for (;;) {
+    // —— 选择目标：自动发现（可重扫）或手动输 IP ——
+    let target = null;
+    if (!skipDiscovery) {
+      log.info('正在搜索同一网络中等待配对的服务器（约 5 秒）...');
+      for (;;) {
+        const list = await discover(5000);
+        if (list.length) {
+          log.plain('  发现以下服务器：');
+          list.forEach((s, i) => log.plain(`   [${i + 1}] ${s.hostname}  (${s.ip})`));
+          const pick = (await ask(`请选择 [1-${list.length}]，或 [r] 重新扫描 / [m] 手动输入 IP / [0] 返回菜单: `)).trim().toLowerCase();
+          if (pick === 'r') {
+            log.info('正在重新扫描...');
+            continue;
+          }
+          if (pick === '0' || pick === 'q') return;
+          if (pick === 'm') {
+            target = await askAddress();
+            if (!target) continue;
+            break;
+          }
+          const idx = parseInt(pick, 10);
+          if (!idx || idx < 1 || idx > list.length) {
+            log.warn('输入无效，请重试');
+            continue;
+          }
+          target = { host: list[idx - 1].ip, port: list[idx - 1].httpPort };
+          break;
+        }
+        log.warn('未自动发现服务器（可能被路由器/AP 隔离、广播被拦截，或服务器尚未启动）');
+        const pick = (await ask('请选择: [r] 重新扫描 / [m] 手动输入 IP / [0] 返回菜单: ')).trim().toLowerCase();
+        if (pick === 'r') {
+          log.info('正在重新扫描...');
+          continue;
+        }
+        if (pick === '0' || pick === 'q') return;
+        if (pick === 'm' || pick === '') {
+          target = await askAddress();
+          if (!target) continue;
+          break;
+        }
         log.warn('输入无效，请重试');
-        continue;
       }
-      target = { host: list[idx - 1].ip, port: list[idx - 1].httpPort };
-      break;
     }
-    log.warn('未自动发现服务器（可能被路由器/AP 隔离、广播被拦截，或服务器尚未启动）');
-    const pick = (await ask('请选择: [r] 重新扫描 / [m] 手动输入 IP / [0] 返回菜单: ')).trim().toLowerCase();
-    if (pick === 'r') {
-      log.info('正在重新扫描...');
-      continue;
-    }
-    if (pick === '0' || pick === 'q') { cancelled = true; break; }
-    if (pick === 'm' || pick === '') {
-      target = await askAddress();
-      if (!target) continue;
-      break;
-    }
-    log.warn('输入无效，请重试');
-  }
-  if (cancelled || !target) return;
 
-  let code = null;
-  for (let i = 0; i < 3; i++) {
-    const raw = (await ask('请输入服务器屏幕上显示的 6 位配对码: ')).trim().replace(/\s+/g, '');
-    if (/^\d{6}$/.test(raw)) { code = raw; break; }
-    log.warn('配对码应为 6 位数字，请重试');
-  }
-  if (!code) {
-    log.error('多次输入无效，退出');
-    return;
-  }
+    // —— 配对码（一次性使用，注意服务器屏幕可能已轮换）——
+    let code = null;
+    for (let i = 0; i < 3; i++) {
+      const raw = (await ask('请输入服务器屏幕上显示的 6 位配对码: ')).trim().replace(/\s+/g, '');
+      if (/^\d{6}$/.test(raw)) { code = raw; break; }
+      log.warn('配对码应为 6 位数字，请重试');
+    }
+    if (!code) {
+      log.error('多次输入无效，退出');
+      return;
+    }
 
-  log.info(`正在连接 ${target.host}:${target.port} 并部署公钥（部署与体检步骤实时回传）...`);
-  let done;
-  try {
-    done = await submit({
-      ...target,
-      code,
-      pubKey: pub.pubKey,
-      onStep: (s) => log.step(s),
-    });
-  } catch (e) {
-    log.error(`配对失败：${e.message}`);
+    // —— TCP 预检 + 提交 ——
+    log.info(`正在连接 ${target.host}:${target.port} 并部署公钥（部署与体检步骤实时回传）...`);
+    try {
+      await preflightTcp(target, 8000);
+      log.ok(`预检通过：TCP ${target.host}:${target.port} 可达`);
+    } catch (e) {
+      log.error(`预检失败：${e.message}`);
+    }
+    try {
+      done = await submit({
+        ...target,
+        code,
+        pubKey: pub.pubKey,
+        onStep: (s) => log.step(s),
+        onConnected: (status) => log.ok(`服务器已受理（HTTP ${status}），正在接收执行结果...`),
+      });
+      break;
+    } catch (e) {
+      log.error(`配对失败：${e.message}`);
+    }
+
+    // —— 失败重试菜单（配对码一次性，重试需重输新码）——
+    const pick = (await ask('请选择: [n] 重输配对码（当前服务器） / [r] 重新扫描 / [m] 手动输 IP / [0] 返回菜单: ')).trim().toLowerCase();
+    if (pick === 'n') { skipDiscovery = true; continue; }
+    if (pick === 'r' || pick === 'm') { skipDiscovery = false; continue; }
     return;
   }
   if (!done.ok) {

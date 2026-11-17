@@ -112,17 +112,20 @@ function userMatchesConfig(entry, user) {
   return false;
 }
 
-/** 解析 SDDL，返回允许访问的账户集合与受保护标志 */
+/** 解析 SDDL，返回允许访问的账户集合（账户位于第六段 fields[5]） */
 function parseSddl(sddl) {
   const aceRe = /\(([^)]+)\)/g;
   const allows = [];
   let m;
   while ((m = aceRe.exec(sddl))) {
     const fields = m[1].split(';');
+    // SDDL ACE: (type;flags;rights;object_guid;inherit_object_guid;account_sid)
     if (fields[0] !== 'A') continue;
-    allows.push({ rights: fields[2] || '', account: (fields[4] || '').toLowerCase() });
+    const account = (fields[5] || '').toLowerCase();
+    if (!account) continue;
+    allows.push({ rights: fields[2] || '', account });
   }
-  return { allows, protected: undefined };
+  return { allows };
 }
 
 const ACL_OK_ACCOUNTS = new Set(['sy', '*s-1-5-18', 'ba', '*s-1-5-32-544']);
@@ -343,26 +346,26 @@ async function runAudit({ pubKeys = [], onStep } = {}) {
     return { status: 'WARN', detail: '未找到本地账户对象' };
   });
 
-  // 10. 端口与防火墙配置
+  // 10. 端口监听与防火墙配置（快速检查：netstat + 按名查规则，避免慢速 WMI 管道）
   await doCheck('端口与防火墙配置', async () => {
     const ports = cfg.ports.length ? [...new Set(cfg.ports)] : ['22'];
-    const portArgs = ports.map((p) => `'${p}'`).join(',');
-    const r = runPS(
-      `$ports = @(${portArgs}); $matched = @(); ` +
-      `try { Get-NetFirewallRule -Direction Inbound -Action Allow -Enabled True -ErrorAction Stop | ` +
-      `Get-NetFirewallPortFilter -ErrorAction Stop | ForEach-Object { $lp = @($_.LocalPort); foreach ($p in $ports) { if ($lp -contains $p) { $matched += $p } } } } catch {} ` +
-      `'MATCHED=' + (($matched | Select-Object -Unique) -join ',')`,
-    );
-    const m = /MATCHED=(.*)/.exec(r.stdout);
-    const matched = m && m[1] ? m[1].split(',').filter(Boolean) : [];
-    if (ports.every((p) => matched.includes(p))) {
-      return { status: 'OK', detail: `端口 ${ports.join('/')} 已放行` };
+    // ① sshd 是否在监听配置端口
+    const r1 = run('netstat.exe', ['-ano']);
+    const listening = ports.filter((p) =>
+      r1.stdout.split(/\r?\n/).some((l) => /LISTENING/i.test(l) && l.includes(`:${p} `)));
+    if (!listening.length) {
+      return { status: 'FAIL', detail: `sshd 未监听配置端口 ${ports.join('/')}（服务未启动或配置了其他端口）`, fixId: 'service' };
     }
-    return {
-      status: 'WARN',
-      detail: `未发现端口 ${ports.join('/')} 的入站放行规则（若防火墙开启会拦截连接），仅配置层面提示`,
-      fixId: ports.includes('22') ? 'firewall' : null,
-    };
+    // ② 防火墙放行规则（按已知规则名快速查询，兼容英文/中文输出）
+    let ruleFound = false;
+    for (const name of ['OpenSSH-Server-In-TCP']) {
+      const r = run('netsh.exe', ['advfirewall', 'firewall', 'show', 'rule', `name=${name}`]);
+      if (r.code === 0 && /(?:Enabled|已启用)[:：]\s*(Yes|是)/i.test(r.stdout)) { ruleFound = true; break; }
+    }
+    if (ruleFound) {
+      return { status: 'OK', detail: `端口 ${listening.join('/')} 监听中，防火墙已放行` };
+    }
+    return { status: 'WARN', detail: `端口 ${listening.join('/')} 监听中，但未发现 OpenSSH 放行规则（若防火墙开启可能拦截连接）`, fixId: 'firewall' };
   });
 
   // 11. 微软账户 Match 风险

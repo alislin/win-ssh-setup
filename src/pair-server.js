@@ -156,6 +156,9 @@ class PairServer {
       log.info(`客户端 ${clientHost}（${req.socket.remoteAddress}）配对成功，开始部署...`);
       this.busy = true;
       res.writeHead(200, { 'Content-Type': 'application/x-ndjson; charset=utf-8' });
+      // VPN/高延迟路径下小包流式传输：立即冲刷响应头并禁用 Nagle，避免首包被缓冲
+      if (res.socket) res.socket.setNoDelay(true);
+      res.flushHeaders();
 
       const writeLine = (obj) => {
         try { res.write(`${JSON.stringify(obj)}\n`); } catch { /* 忽略 */ }
@@ -164,6 +167,8 @@ class PairServer {
         log.step(s);
         writeLine({ type: 'step', name: s.name, status: s.status, detail: s.detail });
       };
+      // 受理即回执：客户端 1 秒内必有首条反馈，用于区分"未连上"与"执行中"
+      emitStep({ name: '0/6 受理', status: 'OK', detail: `客户端 ${clientHost}（${req.socket.remoteAddress}）` });
 
       (async () => {
         const r = await runDeploy({
@@ -239,6 +244,8 @@ class PairServer {
       log.info(`客户端请求清理 ${fps.length} 个旧公钥指纹...`);
       this.busy = true;
       res.writeHead(200, { 'Content-Type': 'application/x-ndjson; charset=utf-8' });
+      if (res.socket) res.socket.setNoDelay(true);
+      res.flushHeaders();
       const writeLine = (obj) => {
         try { res.write(`${JSON.stringify(obj)}\n`); } catch { /* 忽略 */ }
       };
@@ -246,6 +253,7 @@ class PairServer {
         log.step(s);
         writeLine({ type: 'step', name: s.name, status: s.status, detail: s.detail });
       };
+      emitStep({ name: '清理 受理', status: 'OK', detail: `${fps.length} 个指纹` });
 
       try {
         const result = removeByFingerprints({
