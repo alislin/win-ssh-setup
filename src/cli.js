@@ -317,6 +317,9 @@ async function roleServer() {
   process.on('SIGINT', cleanupAll);
   process.on('SIGBREAK', cleanupAll);
   process.on('exit', () => server.stop());
+
+  // 挂起等待客户端配对（Ctrl+C 退出），避免提前返回导致菜单循环继续
+  await new Promise(() => {});
 }
 
 /* ---------------- [2] 客户端 ---------------- */
@@ -526,24 +529,39 @@ function printMenu() {
   log.plain('   [0] 退出');
 }
 
-async function main() {
-  log.banner();
-  const arg = (process.argv[2] || '').toLowerCase();
-  let role = { server: 'server', client: 'client', local: 'local', keys: 'keys' }[arg] || null;
-  if (!role) {
-    printMenu();
-    const ans = (await ask('请选择 [0-4]: ')).trim();
-    role = { '1': 'server', '2': 'client', '3': 'local', '4': 'keys' }[ans];
-    if (!role) {
-      rl.close();
-      return;
-    }
-  }
+async function runRole(role) {
   if (role === 'server') await roleServer();
   else if (role === 'client') await roleClient();
   else if (role === 'keys') await roleKeyMgr();
   else await roleLocal();
-  if (role !== 'server') await pause();
+}
+
+async function main() {
+  log.banner();
+  const arg = (process.argv[2] || '').toLowerCase();
+  const role = { server: 'server', client: 'client', local: 'local', keys: 'keys' }[arg] || null;
+
+  // 显式传参：一次性执行，跑完退出（便于脚本调用）
+  if (role) {
+    await runRole(role);
+    if (role !== 'server') await pause();
+    else rl.close();
+    return;
+  }
+
+  // 交互模式：主菜单循环，子流程返回后回到菜单，[0] 退出
+  for (;;) {
+    printMenu();
+    const ans = (await ask('请选择 [0-4]: ')).trim().toLowerCase();
+    if (ans === '0' || ans === 'q') break;
+    const pick = { '1': 'server', '2': 'client', '3': 'local', '4': 'keys' }[ans];
+    if (!pick) {
+      log.warn('无效选项，请重新选择');
+      continue;
+    }
+    await runRole(pick);
+  }
+  rl.close();
 }
 
 function fingerprintOf(pubKey) {
