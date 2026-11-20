@@ -60,10 +60,12 @@ function patchConfig(original) {
  * @param {object} opts
  * @param {string} opts.pubKey 客户端公钥（单行）
  * @param {string} [opts.clientHostname] 客户端主机名（用于同主机旧 key 识别）
+ * @param {boolean} [opts.skipRestart] 颁发模式：授权文件即时生效，无 sshd_config 变更时跳过重启（避免打断现有 SSH 会话）
  * @param {(step:{name:string,status:string,detail:string})=>void} [opts.onStep] 每步回调
  * @returns {Promise<{ok:boolean, steps:Array, userKeysPath:string, adminKeysPath:string|null, configBackup:string|null, staleKeys:Array}>}
  */
-async function runDeploy({ pubKey, clientHostname, onStep }) {
+async function runDeploy(opts = {}) {
+  const { pubKey, clientHostname, onStep, skipRestart } = opts;
   const steps = [];
   let configBackup = null;
   let aborted = false;
@@ -132,6 +134,11 @@ async function runDeploy({ pubKey, clientHostname, onStep }) {
   });
 
   await doStep('6/6 重启 sshd 服务', async () => {
+    // 颁发模式（skipRestart）：authorized_keys 每次认证即时读取，仅加公钥无需重启；
+    // 但若本次修补了 sshd_config（configBackup 非空），仍需重启使配置生效
+    if (skipRestart && !configBackup) {
+      return { status: 'SKIP', detail: '无 sshd_config 变更，跳过重启（授权文件即时生效，不打断现有 SSH 会话）' };
+    }
     // 先判断服务是否注册（避免 PowerShell 中文报错乱码导致无法识别原因）
     const r = runPS(
       `$s = Get-Service -Name sshd -ErrorAction SilentlyContinue; ` +

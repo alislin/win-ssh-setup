@@ -29,16 +29,28 @@ function deleteKeyPair() {
   }
 }
 
-/** 生成 ed25519 空口令密钥对 */
-function createKeyPair() {
-  const { sshDir, keyPath, pubPath } = keyPaths();
-  fs.mkdirSync(sshDir, { recursive: true });
+/**
+ * 生成 ed25519 密钥对。
+ * @param {object} [opts]
+ * @param {string} [opts.keyPath] 密钥文件路径（默认 ~/.ssh/id_ed25519）
+ * @param {string} [opts.passphrase] 私钥口令（默认空 = 完全免密）
+ * @param {string} [opts.comment] 公钥注释（默认 user@hostname）
+ * @returns {{keyPath:string, pubPath:string, pubKey:string}}
+ */
+function createKeyPair(opts = {}) {
+  const { keyPath: target = keyPaths().keyPath, passphrase = '', comment } = opts;
+  const pubTarget = `${target}.pub`;
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  if (fs.existsSync(target) || fs.existsSync(pubTarget)) {
+    throw new Error(`密钥文件已存在，拒绝覆盖：${target}`);
+  }
   const kg = resolveTool('ssh-keygen');
   if (!kg) throw new Error('未找到 ssh-keygen，请先在“设置 → 可选功能”中安装 OpenSSH 客户端');
   const { user, hostname } = userInfo();
-  const r = run(kg, ['-t', 'ed25519', '-f', keyPath, '-N', '', '-C', `${user}@${hostname}`]);
+  const finalComment = comment !== undefined ? comment : `${user}@${hostname}`;
+  const r = run(kg, ['-t', 'ed25519', '-f', target, '-N', passphrase, '-C', finalComment]);
   if (r.code !== 0) throw new Error(`ssh-keygen 失败：${r.stderr || r.stdout || '未知错误'}`);
-  return { keyPath, pubPath, pubKey: fs.readFileSync(pubPath, 'utf8').trim() };
+  return { keyPath: target, pubPath: pubTarget, pubKey: fs.readFileSync(pubTarget, 'utf8').trim() };
 }
 
 module.exports = { keyPaths, findKeyPair, deleteKeyPair, createKeyPair };

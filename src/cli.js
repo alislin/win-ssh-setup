@@ -8,6 +8,7 @@ const env = require('./env');
 const elevate = require('./elevate');
 const keygen = require('./keygen');
 const keymgr = require('./keymgr');
+const issue = require('./issue');
 const install = require('./install');
 const { runDeploy } = require('./deploy');
 const { runAudit, runFix } = require('./audit');
@@ -140,6 +141,14 @@ function printAuditSummary(audit) {
 
 /* ---------------- [4] 密钥管理 ---------------- */
 
+/** 公钥类别标注：已颁发 → 本机客户端 → 外部配对（互斥，按优先级） */
+function keyTagOf(k, clientFp) {
+  const issued = issue.issuedLabelOf(k.comment);
+  if (issued) return { text: `已颁发→${issued}`, kind: 'issued' };
+  if (clientFp && k.fingerprint && k.fingerprint === clientFp) return { text: '本机客户端', kind: 'client' };
+  return { text: '外部配对', kind: 'remote' };
+}
+
 function renderKeyManager() {
   const { user } = userInfo();
   log.plain('');
@@ -147,6 +156,7 @@ function renderKeyManager() {
 
   // 客户端密钥（本机身份）
   const ck = keygen.findKeyPair();
+  const clientFp = ck ? keymgr.fingerprint(ck.pubKey) : null;
   log.plain(`  ${c.bold}── 客户端密钥（本机身份，用于连别人）──${c.reset}`);
   if (ck) {
     log.plain(`  K1  ${keymgr.algoName(ck.pubKey)}  ${c.cyan}${keymgr.fingerprint(ck.pubKey)}${c.reset}  ${keymgr.keyComment(ck.pubKey)}`);
@@ -157,6 +167,7 @@ function renderKeyManager() {
 
   // 服务端授权公钥（部署到本机的）
   log.plain(`  ${c.bold}── 服务端授权公钥（部署到本机的，本机作为服务端）──${c.reset}`);
+  log.plain(`  ${c.dim}标注说明：〔已颁发→标签〕本机颁发给其他设备  〔本机客户端〕本机身份公钥  〔外部配对〕其他电脑配对部署${c.reset}`);
   const groups = keymgr.listServerKeys();
   const entries = [];
   let n = 1;
@@ -168,8 +179,9 @@ function renderKeyManager() {
     }
     log.plain(`  ${c.dim}${g.label}文件: ${g.file}${g.exists ? '' : '（不存在）'}${c.reset}`);
     for (const k of g.keys) {
-      log.plain(`  [${n}] (${g.label}) ${k.algo}  ${c.cyan}${k.fingerprint}${c.reset}  ${k.comment}`);
-      entries.push({ ...k, file: g.file, label: g.label, scope: g.scope });
+      const tag = keyTagOf(k, clientFp);
+      log.plain(`  [${n}] (${g.label}) ${k.algo}  ${c.cyan}${k.fingerprint}${c.reset}  ${k.comment}  ${c.dim}〔${tag.text}〕${c.reset}`);
+      entries.push({ ...k, file: g.file, label: g.label, scope: g.scope, tag });
       n++;
     }
     if (!g.keys.length) log.plain(`  ${c.dim}（空）${c.reset}`);
@@ -240,7 +252,11 @@ async function keyMgrDelete(entries) {
     picked.push(e);
   }
   log.plain('  将删除：');
-  for (const e of picked) log.plain(`   - (${e.label}) ${e.fingerprint}  ${e.comment}`);
+  for (const e of picked) log.plain(`   - 〔${e.tag.text}〕(${e.label}) ${e.fingerprint}  ${e.comment}`);
+  const hasClient = picked.some((e) => e.tag && e.tag.kind === 'client');
+  const hasIssued = picked.some((e) => e.tag && e.tag.kind === 'issued');
+  if (hasClient) log.warn('选中项包含本机客户端密钥：删除后本机将无法免密连接所有已配对服务器（重新配对可恢复）');
+  if (hasIssued) log.info('已颁发公钥删除即吊销对应设备的免密权限，该设备需重新颁发');
   const needAdmin = picked.some((e) => e.scope === 'admin');
   if (needAdmin && !env.isAdmin() && !(await requireAdmin())) return;
   const ans = await ask('确认删除？[y/N]: ');
@@ -603,6 +619,108 @@ async function roleLocal() {
   log.plain('');
 }
 
+/* ---------------- [5] 密钥颁发 ---------------- */
+
+async function roleIssue() {
+  const { user, hostname } = userInfo();
+  log.info(`当前用户：${user}（密钥颁发模式：为其他设备生成专用密钥，公钥部署到本机，私钥导出到桌面）`);
+  if (!(await requireAdmin())) return;
+  if (!(await ensureSshInstalled())) return;
+
+  // 设备标签：必填，且不得与桌面已有文件冲突
+  let label = null;
+  let paths = null;
+  for (let i = 0; i < 3 && !label; i++) {
+    const raw = (await ask('请输入设备标签（必填，用于文件名与公钥注释，如 phone / pad）: ')).trim();
+    const s = issue.sanitizeLabel(raw);
+    if (!s) {
+      log.warn('标签不能为空（非法字符已自动替换为 -，中文可用）');
+      continue;
+    }
+    if (issue.labelConflict(s)) {
+      log.warn(`桌面已存在同名密钥文件（issued-${s}），请换一个标签或先删除旧文件`);
+      continue;
+    }
+    label = s;
+    paths = issue.issueKeyPaths(label);
+  }
+  if (!label) {
+    log.error('多次输入无效，退出');
+    return;
+  }
+
+  // 口令：默认空口令（完全免密），可选设置（手机等易丢失设备建议设置）
+  let passphrase = '';
+  if (confirmYes(await ask('是否为该密钥设置口令？手机等易丢失设备建议设置。[y/N]: '), false)) {
+    for (let i = 0; i < 3; i++) {
+      const p1 = await ask('请输入口令（直接回车表示不设口令）: ');
+      const p2 = await ask('请再次输入口令确认: ');
+      if (p1 === p2) {
+        passphrase = p1;
+        break;
+      }
+      log.warn('两次输入不一致，请重试');
+    }
+  }
+
+  // 写入预告：注释是将来在密钥管理中辨认/吊销的唯一线索
+  const comment = `${user}@${hostname}#issued:${label}`;
+  log.plain('');
+  log.plain(`  密钥文件：${c.cyan}${paths.keyPath}${c.reset}`);
+  log.plain(`  公钥注释：${c.cyan}${comment}${c.reset}${c.dim}  ← 将写入授权文件，[4] 密钥管理 中据此识别${c.reset}`);
+  if (!confirmYes(await ask('确认生成并部署？[Y/n]: '))) {
+    log.warn('已取消，未做任何改动');
+    return;
+  }
+
+  log.info('正在生成 ed25519 密钥对（口令留空 = 完全免密）...');
+  const created = issue.generateIssuedKey({ label, passphrase, comment });
+  log.ok(`密钥对已生成：${created.keyPath}`);
+  log.ok(`指纹：${keymgr.fingerprint(created.pubKey)}（导入后可在设备端核对）`);
+
+  log.info('开始部署公钥（授权文件即时生效，无配置变更时不重启 sshd）...');
+  const r = await runDeploy({ pubKey: created.pubKey, skipRestart: true, onStep: (s) => log.step(s) });
+  if (!r.ok) {
+    log.error('部署存在失败步骤，详见上方日志；私钥文件仍在桌面，排查后可删除重试');
+    return;
+  }
+  log.ok('部署完成');
+
+  log.info('开始配置体检（无连接，纯配置层检查）...');
+  const audit = await runAudit({ pubKeys: [created.pubKey], onStep: (s) => log.step(s) });
+  printAuditSummary(audit);
+  const fixables = [...new Set(audit.checks.filter((x) => x.fixId && x.status !== 'OK' && x.status !== 'SKIP').map((x) => x.fixId))];
+  if (fixables.length) {
+    const ans = await ask('检测到可自动修复项，是否尝试修复？[y/N]: ');
+    if (confirmYes(ans, false)) {
+      for (const fixId of fixables) {
+        const res = await runFix(fixId);
+        log[res.ok ? 'ok' : 'error'](`修复 [${fixId}]：${res.msg}`);
+      }
+      log.info('重新体检...');
+      printAuditSummary(await runAudit({ pubKeys: [created.pubKey], onStep: (s) => log.step(s) }));
+    }
+  }
+
+  // 交付：私钥文件导出到桌面，用户自行拷贝导入；确认后服务器零残留
+  log.plain('');
+  log.plain(`  ${c.bold}交付私钥${c.reset}  文件：${c.cyan}${created.keyPath}${c.reset}`);
+  log.plain('  请拷贝到目标设备并导入（Termux / Termius / Blink 等，方法见 docs/使用说明.md）');
+  log.plain(`  设备端连接：ssh ${user}@<本机IP>`);
+  if (confirmYes(await ask('已拷贝并导入目标设备？[y/N]: '), false)) {
+    const removed = issue.deleteIssuedFiles(created);
+    log.ok(`已删除服务器上的密钥文件（${removed.length} 个），服务器零残留`);
+    log.info(`吊销入口：[4] 密钥管理 → 〔已颁发→${label}〕→ [d] 删除`);
+  } else {
+    log.warn(`私钥暂保留在桌面：${created.keyPath}`);
+    log.info(`导入完成后建议手动删除私钥与公钥：${created.keyPath} / ${created.pubPath}`);
+  }
+
+  log.plain('');
+  log.plain(`  ${c.green}${c.bold}✔ 颁发完成！${c.reset} 部署${c.green}✔${c.reset} 体检${audit.ok ? c.green + '✔' : c.yellow + '!' + c.reset}`);
+  log.plain('');
+}
+
 /* ---------------- 入口 ---------------- */
 
 function printMenu() {
@@ -611,6 +729,7 @@ function printMenu() {
   log.plain('   [2] 客户端    —— 本机发起连接，把本机公钥部署到对方');
   log.plain('   [3] 本机自连  —— 生成密钥并部署到本机（ssh localhost）');
   log.plain('   [4] 密钥管理  —— 客户端/服务端密钥查看、体检、删除、清空、备份');
+  log.plain('   [5] 密钥颁发  —— 服务端为手机等设备生成专用密钥并部署，导出私钥自行导入');
   log.plain('   [0] 退出');
 }
 
@@ -618,13 +737,14 @@ async function runRole(role) {
   if (role === 'server') await roleServer();
   else if (role === 'client') await roleClient();
   else if (role === 'keys') await roleKeyMgr();
+  else if (role === 'issue') await roleIssue();
   else await roleLocal();
 }
 
 async function main() {
   log.banner();
   const arg = (process.argv[2] || '').toLowerCase();
-  const role = { server: 'server', client: 'client', local: 'local', keys: 'keys' }[arg] || null;
+  const role = { server: 'server', client: 'client', local: 'local', keys: 'keys', issue: 'issue' }[arg] || null;
 
   // 显式传参：一次性执行，跑完退出（便于脚本调用）
   if (role) {
@@ -637,9 +757,9 @@ async function main() {
   // 交互模式：主菜单循环，子流程返回后回到菜单，[0] 退出
   for (;;) {
     printMenu();
-    const ans = (await ask('请选择 [0-4]: ')).trim().toLowerCase();
+    const ans = (await ask('请选择 [0-5]: ')).trim().toLowerCase();
     if (ans === '0' || ans === 'q') break;
-    const pick = { '1': 'server', '2': 'client', '3': 'local', '4': 'keys' }[ans];
+    const pick = { '1': 'server', '2': 'client', '3': 'local', '4': 'keys', '5': 'issue' }[ans];
     if (!pick) {
       log.warn('无效选项，请重新选择');
       continue;
