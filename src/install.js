@@ -2,7 +2,7 @@
 
 const log = require('./log');
 const { run, runPS, pump } = require('./exec');
-const { sshInstalled } = require('./env');
+const { sshInstalled, sshdPath } = require('./env');
 
 /** 通过 winget 安装 OpenSSH Preview（Microsoft.OpenSSH.Preview） */
 async function installViaWinget() {
@@ -54,6 +54,37 @@ function ensureServiceRunning() {
   return m ? m[1] : 'UNKNOWN';
 }
 
+/**
+ * 注册 sshd Windows 服务（sshd.exe 存在但服务未注册的"半安装"状态修复）。
+ * 参照 Win32-OpenSSH 官方 install-sshd.ps1 的做法：注册服务 + 事件日志支持；服务已存在时幂等跳过。
+ * @returns {boolean} 服务可用（本次注册成功或本已存在）
+ */
+function registerSshService() {
+  const exe = sshdPath();
+  if (!exe) {
+    log.error('未找到 sshd.exe，无法注册服务');
+    return false;
+  }
+  const r = runPS([
+    `$bin = '${exe.replace(/'/g, "''")}';`,
+    `$s = Get-Service -Name sshd -ErrorAction SilentlyContinue;`,
+    `if ($s) { 'EXISTS' }`,
+    `else {`,
+    `New-Service -Name sshd -DisplayName 'OpenSSH SSH Server' -BinaryPathName ('"' + $bin + '"') -StartupType Automatic -ErrorAction Stop | Out-Null;`,
+    `$reg = 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\EventLog\\Application\\OpenSSH';`,
+    `New-Item -Path $reg -ErrorAction SilentlyContinue | Out-Null;`,
+    `New-ItemProperty -Path $reg -Name EventMessageFile -Value "$env:SystemRoot\\Microsoft.NET\\Framework64\\v4.0.30319\\EventLogMessages.dll" -PropertyType String -ErrorAction SilentlyContinue | Out-Null;`,
+    `'REGISTERED'`,
+    `}`,
+  ].join(' '));
+  if (r.code === 0 && /(EXISTS|REGISTERED)/.test(r.stdout)) {
+    log.ok(/EXISTS/.test(r.stdout) ? 'sshd 服务已存在，无需注册' : `已注册 sshd 服务（${exe}）`);
+    return true;
+  }
+  log.error(`注册 sshd 服务失败：${(r.stderr || r.stdout || '未知原因').split(/\r?\n/)[0]}`);
+  return false;
+}
+
 /** 确保防火墙放行 SSH 22 端口（OpenSSH-Server-In-TCP 规则） */
 function ensureFirewall22() {
   const q = run('netsh.exe', ['advfirewall', 'firewall', 'show', 'rule', 'name=OpenSSH-Server-In-TCP']);
@@ -67,4 +98,4 @@ function ensureFirewall22() {
   return a.code === 0;
 }
 
-module.exports = { installOpenSSH, ensureServiceRunning, ensureFirewall22 };
+module.exports = { installOpenSSH, ensureServiceRunning, ensureFirewall22, registerSshService };

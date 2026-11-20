@@ -132,12 +132,16 @@ async function runDeploy({ pubKey, clientHostname, onStep }) {
   });
 
   await doStep('6/6 重启 sshd 服务', async () => {
+    // 先判断服务是否注册（避免 PowerShell 中文报错乱码导致无法识别原因）
     const r = runPS(
-      `Set-Service -Name sshd -StartupType Automatic -ErrorAction SilentlyContinue; ` +
-      `Restart-Service -Name sshd -Force; ` +
-      `(Get-Service -Name sshd).Status`
+      `$s = Get-Service -Name sshd -ErrorAction SilentlyContinue; ` +
+      `if (-not $s) { 'NO_SERVICE' } ` +
+      `else { Set-Service -Name sshd -StartupType Automatic -ErrorAction SilentlyContinue; Restart-Service -Name sshd -Force; (Get-Service -Name sshd).Status }`
     );
     const st = r.stdout.trim();
+    if (st === 'NO_SERVICE') {
+      throw new Error('sshd 服务未注册（sshd.exe 存在但服务缺失，半安装状态）——请在服务器模式重新运行本工具，可自动注册并启动服务');
+    }
     if (r.code !== 0 || !/Running/i.test(st)) {
       throw new Error(`服务状态异常：${st || r.stderr || '未知'}`);
     }

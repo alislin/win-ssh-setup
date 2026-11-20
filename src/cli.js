@@ -44,13 +44,31 @@ async function requireAdmin() {
   return false;
 }
 
-/** 确保 OpenSSH Server 已安装且 sshd 正在运行（含安装询问与回退） */
+/** 确保 OpenSSH Server 已安装且 sshd 正在运行（含安装询问、半安装修复与回退） */
 async function ensureSshInstalled() {
   if (env.sshInstalled()) {
     const st = install.ensureServiceRunning();
     install.ensureFirewall22();
-    if (st === 'Running') log.ok('OpenSSH Server 已在运行');
-    else log.warn(`OpenSSH Server 服务状态：${st}（配置部署后第 6 步会再次尝试重启）`);
+    if (st === 'Running') {
+      log.ok('OpenSSH Server 已在运行');
+    } else if (st === 'MISSING') {
+      // 半安装状态：sshd.exe 存在但 sshd 服务未注册（MSI 安装不完整/系统升级后服务丢失）
+      log.warn(`检测到 sshd.exe 已存在（${env.sshdPath()}）但 sshd 服务未注册`);
+      const ans = await ask('是否自动注册并启动 sshd 服务？[Y/n]: ');
+      if (!confirmYes(ans)) {
+        log.warn('已跳过注册，部署第 6 步（重启服务）将失败');
+        return true;
+      }
+      if (!install.registerSshService()) {
+        log.error('自动注册失败。可手动修复：winget install --id Microsoft.OpenSSH.Preview -e（重装 MSI 会补建服务）');
+        return true;
+      }
+      const st2 = install.ensureServiceRunning();
+      if (st2 === 'Running') log.ok('sshd 服务已注册并启动（首次启动自动生成主机密钥）');
+      else log.warn(`sshd 服务状态：${st2}（配置部署后第 6 步会再次尝试重启）`);
+    } else {
+      log.warn(`OpenSSH Server 服务状态：${st}（配置部署后第 6 步会再次尝试重启）`);
+    }
     return true;
   }
   const ans = await ask('未检测到 OpenSSH Server，是否现在安装（winget，约 10-60 秒）？[Y/n]: ');
