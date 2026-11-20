@@ -12,7 +12,7 @@ const install = require('./install');
 const { runDeploy } = require('./deploy');
 const { runAudit, runFix } = require('./audit');
 const { PairServer } = require('./pair-server');
-const { discover, submit, cleanup, preflightTcp } = require('./pair-client');
+const { discover, submit, cleanup, destroyCode, preflightTcp } = require('./pair-client');
 const { verifyPasswordless } = require('./verify');
 const { resolveTool } = require('./exec');
 const { userInfo } = require('./env');
@@ -310,6 +310,7 @@ async function roleServer() {
   log.plain(`  ${c.bold}══ 等待客户端连接 ══${c.reset}`);
   log.plain(`  本机地址 : ${c.cyan}${ips.length ? ips.join('  ') : '未检测到局域网 IP（可让客户端手动输入主机名）'}${c.reset}   端口 : ${PAIR_HTTP_PORT}`);
   log.plain(`  配对码   : ${c.green}${c.bold}${server.displayCode()}${c.reset}   ← 每 5 分钟自动轮换，配对成功后立即更新`);
+  log.plain(`  快捷键   : ${c.bold}[p]${c.reset} 生成持久配对码（异地连接，不轮换）  ${c.bold}[d]${c.reset} 销毁持久码  ${c.bold}[q]${c.reset} 退出`);
   log.plain('  客户端配对后：自动部署 → 配置体检（无连接）→ 可选实测；按 Ctrl+C 退出（自动清理临时防火墙规则）');
   log.plain('');
 
@@ -318,7 +319,15 @@ async function roleServer() {
   process.on('SIGBREAK', cleanupAll);
   process.on('exit', () => server.stop());
 
-  // 挂起等待客户端配对（Ctrl+C 退出），避免提前返回导致菜单循环继续
+  // 等待客户端配对的同时监听快捷键：[p] 激活持久码（异地连接用） / [d] 销毁持久码 / [q] 退出
+  rl.on('line', (line) => {
+    const k = String(line || '').trim().toLowerCase();
+    if (k === 'p') server.createPersistentCode();
+    else if (k === 'd') server.destroyPersistentCode();
+    else if (k === 'q') cleanupAll();
+  });
+
+  // 挂起等待客户端配对（Ctrl+C 或 [q] 退出），避免提前返回导致菜单循环继续
   await new Promise(() => {});
 }
 
@@ -382,12 +391,12 @@ async function roleClient() {
       }
     }
 
-    // —— 配对码（一次性使用，注意服务器屏幕可能已轮换）——
+    // —— 配对码：临时码 6 位（一次性）；持久码 8 位（不轮换，可重复使用）——
     let code = null;
     for (let i = 0; i < 3; i++) {
-      const raw = (await ask('请输入服务器屏幕上显示的 6 位配对码: ')).trim().replace(/\s+/g, '');
-      if (/^\d{6}$/.test(raw)) { code = raw; break; }
-      log.warn('配对码应为 6 位数字，请重试');
+      const raw = (await ask('请输入服务器屏幕上显示的配对码（6~8 位数字）: ')).trim().replace(/\s+/g, '');
+      if (/^\d{6,8}$/.test(raw)) { code = raw; break; }
+      log.warn('配对码应为 6~8 位数字，请重试');
     }
     if (!code) {
       log.error('多次输入无效，退出');
@@ -415,7 +424,7 @@ async function roleClient() {
       log.error(`配对失败：${e.message}`);
     }
 
-    // —— 失败重试菜单（配对码一次性，重试需重输新码）——
+    // —— 失败重试菜单（临时码一次性需重输新码；持久码未变可直接重试）——
     const pick = (await ask('请选择: [n] 重输配对码（当前服务器） / [r] 重新扫描 / [m] 手动输 IP / [0] 返回菜单: ')).trim().toLowerCase();
     if (pick === 'n') { skipDiscovery = true; continue; }
     if (pick === 'r' || pick === 'm') { skipDiscovery = false; continue; }
@@ -447,6 +456,23 @@ async function roleClient() {
       } catch (e) {
         log.error(`清理失败：${e.message}`);
       }
+    }
+  }
+
+  // 持久配对码场景：异地设置完成后可远程销毁，避免长期暴露（凭配对签发的会话令牌鉴权）
+  if (done.sessionToken && done.persistent) {
+    const ans = await ask('服务器正在使用持久配对码（不轮换、可重复使用），是否销毁它？[y/N]: ');
+    if (confirmYes(ans, false)) {
+      try {
+        const r = await destroyCode({ ...target, sessionToken: done.sessionToken });
+        if (r.destroyed) log.ok('已销毁服务器上的持久配对码（服务器已回到临时码模式）');
+        else log.info('服务器当前没有激活的持久配对码');
+      } catch (e) {
+        log.error(`销毁失败：${e.message}`);
+        log.info('可改在服务器端按 [d] 销毁；不销毁也不影响已完成的部署，进程退出时自动失效');
+      }
+    } else {
+      log.info('已保留持久配对码，可继续配对其他设备；销毁可在服务器端按 [d]，或进程退出自动失效');
     }
   }
 

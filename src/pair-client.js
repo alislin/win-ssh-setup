@@ -197,4 +197,37 @@ function cleanup({ host, port, sessionToken, fingerprints, keepFingerprint, onSt
   });
 }
 
-module.exports = { discover, submit, cleanup, preflightTcp };
+/** 远程销毁服务器上的持久配对码（凭配对成功后签发的会话令牌鉴权），服务器随即回到临时码模式 */
+function destroyCode({ host, port, sessionToken }, timeoutMs = 15000) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({});
+    const req = http.request({
+      host,
+      port: port || PAIR_HTTP_PORT,
+      path: '/pair/destroy',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        'X-Session-Token': sessionToken || '',
+      },
+    }, (res) => {
+      let buf = '';
+      res.setEncoding('utf8');
+      res.on('data', (ch) => { buf += ch; });
+      res.on('error', () => {});
+      res.on('end', () => {
+        let obj = null;
+        try { obj = JSON.parse(buf); } catch { /* 保留原文 */ }
+        if (res.statusCode === 200 && obj) resolve(obj);
+        else reject(new Error(`服务器返回 ${res.statusCode}：${(obj && obj.error) || buf.trim() || '未知错误'}`));
+      });
+    });
+    req.setTimeout(timeoutMs, () => req.destroy(new Error(`请求超时（${Math.round(timeoutMs / 1000)} 秒无响应）`)));
+    req.on('error', (e) => reject(classifyError(e)));
+    req.write(body);
+    req.end();
+  });
+}
+
+module.exports = { discover, submit, cleanup, destroyCode, preflightTcp };

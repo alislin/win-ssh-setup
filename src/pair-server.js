@@ -5,7 +5,7 @@ const dgram = require('dgram');
 const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
-const { PAIR_HTTP_PORT, BEACON_UDP_PORT, MAGIC, TEMP_FW_RULE, PAIR_CODE_ROTATE_MS } = require('./config');
+const { PAIR_HTTP_PORT, BEACON_UDP_PORT, MAGIC, TEMP_FW_RULE, PAIR_CODE_ROTATE_MS, PAIR_PERSIST_CODE_DIGITS, PAIR_MAX_CODE_FAILS, PAIR_LOCKOUT_MS } = require('./config');
 const { run } = require('./exec');
 const log = require('./log');
 const { validatePubKey, fingerprint, authFilePaths, removeByFingerprints } = require('./keymgr');
@@ -15,13 +15,16 @@ const { lanIPs, userInfo, isAdminGroup } = require('./env');
 
 const FP_RE = /^SHA256:[A-Za-z0-9+/]{43}$/;
 
-/** 服务器端配对服务：HTTP 配对 + UDP 广播信标 + 临时防火墙规则 */
+/** 服务器端配对服务：HTTP 配对 + UDP 广播信标 + 临时防火墙规则 + 持久配对码（异地连接） */
 class PairServer {
   constructor({ rotateMs } = {}) {
-    this.code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
-    this.session = null;
+    this.code = this.genCode(6);
+    this.persistent = false;                // 持久码模式：不轮换、可重复使用，直至手动销毁或进程退出
+    this.session = null;                    // 会话令牌槽，仅最新一次配对持有
     this.rotateMs = rotateMs || PAIR_CODE_ROTATE_MS;
     this.rotateTimer = null;
+    this.fails = 0;                         // 配对码连续校验失败计数（防爆破锁定）
+    this.lockedUntil = 0;                   // 锁定截止时间戳（毫秒），0 表示未锁定
     this.httpServer = null;
     this.beaconSocket = null;
     this.beaconTimer = null;
@@ -30,9 +33,15 @@ class PairServer {
     this.busy = false;
   }
 
-  /** 展示用配对码（3 位一组便于朗读） */
+  /** 生成指定位数的纯数字配对码 */
+  genCode(digits) {
+    return String(crypto.randomInt(0, 10 ** digits)).padStart(digits, '0');
+  }
+
+  /** 展示用配对码（按位数对半分组便于朗读：6 位 → 123 456，8 位 → 1234 5678） */
   displayCode() {
-    return `${this.code.slice(0, 3)} ${this.code.slice(3)}`;
+    const half = Math.ceil(this.code.length / 2);
+    return `${this.code.slice(0, half)} ${this.code.slice(half)}`;
   }
 
   start() {
@@ -64,6 +73,10 @@ class PairServer {
       this.handleCleanup(req, res);
       return;
     }
+    if (url === '/pair/destroy' && req.method === 'POST') {
+      this.handleDestroy(req, res);
+      return;
+    }
     if (req.method !== 'POST' || url !== '/pair') {
       res.writeHead(404);
       res.end('not found');
@@ -82,35 +95,89 @@ class PairServer {
   }
 
   checkCode(req, res) {
+    // 防爆破锁定：连续错误达到阈值后，锁定期间一律拒绝
+    if (Date.now() < this.lockedUntil) {
+      const mins = Math.ceil((this.lockedUntil - Date.now()) / 60000);
+      log.warn(`配对码锁定中，拒绝请求（剩余约 ${mins} 分钟，来自 ${req.socket.remoteAddress}）`);
+      this.failJson(res, 429, `配对码连续错误次数过多，已锁定，请约 ${mins} 分钟后再试`);
+      return false;
+    }
     const code = String(req.headers['x-pair-code'] || '').trim();
-    if (code === this.code) return true;
-    log.warn(`配对码校验失败（来自 ${req.socket.remoteAddress}）`);
+    // timingSafeEqual 需等长 Buffer；长度不同直接判失败（同样计入失败次数）
+    const ok = code.length === this.code.length
+      && crypto.timingSafeEqual(Buffer.from(code), Buffer.from(this.code));
+    if (ok) {
+      this.fails = 0;
+      return true;
+    }
+    this.fails += 1;
+    if (this.fails >= PAIR_MAX_CODE_FAILS) {
+      this.lockedUntil = Date.now() + PAIR_LOCKOUT_MS;
+      this.fails = 0;
+      log.error(`配对码连续错误 ${PAIR_MAX_CODE_FAILS} 次，已锁定 ${Math.round(PAIR_LOCKOUT_MS / 60000)} 分钟（来源 ${req.socket.remoteAddress}）——若非本人操作请检查网络暴露面`);
+    } else {
+      log.warn(`配对码校验失败（第 ${this.fails}/${PAIR_MAX_CODE_FAILS} 次，来自 ${req.socket.remoteAddress}）`);
+    }
     this.failJson(res, 403, '配对码不正确');
     return false;
   }
 
-  /** 生成新配对码并重显在屏幕（reason: 'used' 使用后轮换 / 'timer' 定时轮换） */
+  /** 生成新临时配对码并重显在屏幕（reason: 'used' 使用后轮换 / 'timer' 定时轮换 / 'persistent-off' 销毁持久码后） */
   newCode(reason) {
-    this.code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+    this.code = this.genCode(6);
     log.plain('');
     const codeText = `${log.c.green}${log.c.bold}${this.displayCode()}${log.c.reset}`;
     if (reason === 'timer') {
       const mins = Math.round(this.rotateMs / 60000);
       const period = mins >= 1 ? `每 ${mins} 分钟` : `每 ${Math.round(this.rotateMs / 1000)} 秒`;
       log.info(`配对码定时更新：${codeText} ← ${period}自动轮换，旧码作废；下一位客户端请使用新码`);
+    } else if (reason === 'persistent-off') {
+      log.info(`持久配对码已销毁，已切换回临时码：${codeText} ← 每 ${Math.round(this.rotateMs / 60000)} 分钟自动轮换`);
     } else {
       log.info(`配对码已更新：${codeText} ← 一次性使用，旧码已作废；下一位客户端请使用新码`);
     }
   }
 
-  /** 配对码校验通过即消耗：换码 + 签发后续清理请求所用的会话令牌 */
+  /** 配对码校验通过后调用：持久码保持不变，临时码立即轮换；并签发后续清理/销毁请求所用的会话令牌 */
   consumeCode() {
-    this.newCode('used');
+    if (this.persistent) {
+      log.info('持久配对码保持有效（不轮换，可继续用于后续客户端）');
+    } else {
+      this.newCode('used');
+    }
+    this.fails = 0;
     this.session = {
       token: crypto.randomBytes(24).toString('hex'),
       expires: Date.now() + 10 * 60 * 1000,
     };
     return this.session.token;
+  }
+
+  /** 手动激活持久配对码：8 位数字，不轮换、可重复使用，直至销毁或进程退出（已激活则仅重显，不换码） */
+  createPersistentCode() {
+    if (!this.persistent) {
+      this.code = this.genCode(PAIR_PERSIST_CODE_DIGITS);
+      this.persistent = true;
+      if (this.rotateTimer) { clearInterval(this.rotateTimer); this.rotateTimer = null; }
+      log.plain('');
+      log.info(`持久配对码已激活：${log.c.green}${log.c.bold}${this.displayCode()}${log.c.reset}`);
+      log.warn('该码在进程运行期间持续有效、可重复使用；异地连接需通过端口映射或 VPN 保证本机 22887 端口可达');
+      log.warn('期间请保持本机开机联网（建议暂时关闭睡眠）并保持本窗口开启；按 [d] 销毁或退出进程即全部失效');
+    } else {
+      log.info(`当前持久配对码（未变化）：${log.c.green}${log.c.bold}${this.displayCode()}${log.c.reset}`);
+    }
+  }
+
+  /** 销毁持久配对码，回到临时码模式（恢复定时轮换）。@returns {boolean} 是否确实销毁了持久码 */
+  destroyPersistentCode() {
+    if (!this.persistent) {
+      log.info('当前没有激活的持久配对码');
+      return false;
+    }
+    this.persistent = false;
+    this.rotateTimer = setInterval(() => this.rotateTimed(), this.rotateMs);
+    this.newCode('persistent-off');
+    return true;
   }
 
   /** 定时轮换：仅换码，不影响已签发的会话令牌 */
@@ -136,6 +203,13 @@ class PairServer {
     } catch { /* 连接可能已断开 */ }
   }
 
+  okJson(res, obj) {
+    try {
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(obj));
+    } catch { /* 连接可能已断开 */ }
+  }
+
   handlePair(req, res) {
     this.readBody(req, res, (body) => {
       let payload;
@@ -146,10 +220,12 @@ class PairServer {
       }
       if (!this.checkCode(req, res)) return;
       if (this.busy) return this.failJson(res, 409, '服务器正在处理另一个配对请求，请稍后重试');
-      // 配对码一次性使用：校验通过即轮换并签发会话令牌（后续清理请求凭令牌鉴权）
+      // 临时码一次性使用：校验通过即轮换；持久码保持不变；两种模式均签发会话令牌（后续清理/销毁请求凭令牌鉴权）
       const sessionToken = this.consumeCode();
       if (!validatePubKey(payload.pubkey || '')) {
-        return this.failJson(res, 400, '公钥格式不正确（本次配对码已消耗，请使用服务器屏幕上的新配对码重试）');
+        return this.failJson(res, 400, this.persistent
+          ? '公钥格式不正确（持久配对码仍有效，修正后可直接重试）'
+          : '公钥格式不正确（本次配对码已消耗，请使用服务器屏幕上的新配对码重试）');
       }
 
       const clientHost = String(payload.clientHostname || 'unknown');
@@ -207,6 +283,7 @@ class PairServer {
           staleKeys: (r.staleKeys || []).map((s) => ({ fingerprint: s.fingerprint, algo: s.algo, comment: s.comment })),
           audit: audit ? { ok: audit.ok, failures: audit.failures, warnings: audit.warnings } : null,
           sessionToken,
+          persistent: this.persistent,
         });
         res.end();
         if (r.ok) log.ok(`部署与体检完成，已通知客户端 ${clientHost}。可继续等待其他客户端，Ctrl+C 退出`);
@@ -283,6 +360,16 @@ class PairServer {
       } finally {
         this.busy = false;
       }
+    });
+  }
+
+  /** 远程销毁持久配对码（凭配对成功签发的会话令牌鉴权），销毁后服务器回到临时码模式 */
+  handleDestroy(req, res) {
+    this.readBody(req, res, () => {
+      if (!this.checkSession(req, res)) return;
+      const destroyed = this.destroyPersistentCode();
+      this.okJson(res, { type: 'done', ok: true, destroyed, persistent: this.persistent });
+      if (destroyed) log.ok('客户端已远程销毁持久配对码，服务器回到临时码模式');
     });
   }
 
