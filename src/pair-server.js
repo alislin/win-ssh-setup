@@ -6,7 +6,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const { PAIR_HTTP_PORT, BEACON_UDP_PORT, MAGIC, TEMP_FW_RULE, PAIR_CODE_ROTATE_MS, PAIR_PERSIST_CODE_DIGITS, PAIR_MAX_CODE_FAILS, PAIR_LOCKOUT_MS } = require('./config');
-const { run } = require('./exec');
+const { run, runPS } = require('./exec');
 const log = require('./log');
 const { validatePubKey, fingerprint, authFilePaths, removeByFingerprints } = require('./keymgr');
 const { runDeploy } = require('./deploy');
@@ -29,6 +29,7 @@ class PairServer {
     this.beaconSocket = null;
     this.beaconTimer = null;
     this.fwAdded = false;
+    this.fwMergePrev = null;                // 组策略管控场景：临时开启本地规则合并的配置文件列表（退出时还原）
     this.stopped = false;
     this.busy = false;
   }
@@ -398,9 +399,51 @@ class PairServer {
     if (r.code === 0) {
       this.fwAdded = true;
       log.ok(`已添加临时防火墙规则（TCP ${PAIR_HTTP_PORT}），退出时自动删除`);
+      this.ensureRuleEffective();
+      log.info(`客户端可先执行 Test-NetConnection 服务器IP -Port ${PAIR_HTTP_PORT} 验证配对端口可达`);
     } else {
       log.warn('添加临时防火墙规则失败，若客户端连不上请检查防火墙设置');
     }
+  }
+
+  /**
+   * 确保放行规则真正生效。
+   * 部分机器的防火墙策略由组策略管控（AllowLocalFirewallRules=False），本地添加的规则会被忽略：
+   * 规则显示存在，入站仍按默认 BlockInbound 拦截（症状：ICMP/其他放行端口可达，唯独本工具端口不通）。
+   * 检测到时临时开启本地规则合并并记录原始值，退出时还原。
+   */
+  ensureRuleEffective() {
+    const q = runPS('Get-NetFirewallProfile | Select-Object Name, AllowLocalFirewallRules | ConvertTo-Json -Compress');
+    let profiles;
+    try {
+      profiles = JSON.parse(q.stdout);
+      if (!Array.isArray(profiles)) profiles = [profiles]; // 单个配置文件时 ConvertTo-Json 不返回数组
+    } catch {
+      log.warn('无法读取防火墙配置文件策略（Get-NetFirewallProfile 失败），若客户端连不上请手动检查防火墙策略');
+      return;
+    }
+    // GpoBoolean 枚举经 ConvertTo-Json 序列化为数字：0=False（本地规则被忽略） 1=True 2=Any（未配置，正常态）
+    // 兼容部分环境输出布尔/字符串形式的情形
+    const ignored = profiles.filter((p) => {
+      if (!p) return false;
+      const v = String(p.AllowLocalFirewallRules).toLowerCase();
+      return v === '0' || v === 'false';
+    });
+    if (!ignored.length) return;
+
+    const names = ignored.map((p) => p.name).join(' / ');
+    const setPs = ignored
+      .map((p) => `Set-NetFirewallProfile -Name '${p.name}' -AllowLocalFirewallRules $true`)
+      .join('; ');
+    const s = runPS(setPs);
+    if (s.code !== 0) {
+      log.error(`防火墙策略忽略本地规则，且开启本地规则合并失败：${(s.stderr || s.stdout || '未知原因').split(/\r?\n/)[0]}`);
+      log.warn(`请用本地安全策略 (secpol.msc) 手动放行入站 TCP ${PAIR_HTTP_PORT}，或联系管理员处理`);
+      return;
+    }
+    this.fwMergePrev = ignored.map((p) => ({ name: p.name }));
+    log.warn(`检测到防火墙策略忽略本地规则（${names}），已临时开启本地规则合并使放行规则生效，退出时自动还原`);
+    log.warn('若本机属于域管控，此修改可能被组策略刷新覆盖；届时请用 secpol.msc 放行该端口或由管理员处理');
   }
 
   stop() {
@@ -413,6 +456,15 @@ class PairServer {
     if (this.fwAdded) {
       run('netsh.exe', ['advfirewall', 'firewall', 'delete', 'rule', `name=${TEMP_FW_RULE}`]);
       log.info('已删除临时防火墙规则');
+    }
+    if (this.fwMergePrev) {
+      const ps = this.fwMergePrev
+        .map((p) => `Set-NetFirewallProfile -Name '${p.name}' -AllowLocalFirewallRules $false`)
+        .join('; ');
+      const r = runPS(ps);
+      if (r.code === 0) log.info('已还原防火墙本地规则合并策略');
+      else log.warn('还原防火墙本地规则合并策略失败，请手动执行 Get-NetFirewallProfile 检查');
+      this.fwMergePrev = null;
     }
   }
 }

@@ -14,6 +14,7 @@ const { runAudit, runFix } = require('./audit');
 const { PairServer } = require('./pair-server');
 const { discover, submit, cleanup, destroyCode, preflightTcp } = require('./pair-client');
 const { verifyPasswordless } = require('./verify');
+const serverbook = require('./serverbook');
 const { resolveTool } = require('./exec');
 const { userInfo } = require('./env');
 
@@ -347,6 +348,7 @@ async function roleClient() {
   let done = null;
   let target = null;
   let skipDiscovery = false;
+  let already = null; // 免密预检通过时记录 {user, host}，跳过重复部署
   outer: for (;;) {
     // —— 选择目标：自动发现（可重扫）或手动输 IP ——
     if (!skipDiscovery) {
@@ -391,6 +393,23 @@ async function roleClient() {
       }
     }
 
+    // —— 免密预检：已部署过的服务器若已可免密连接，跳过重复部署（不消耗配对码、服务器端零改动）——
+    if (!skipDiscovery) {
+      const rec = serverbook.findByHost(target.host);
+      if (rec) {
+        const t = new Date(rec.deployedAt);
+        const when = rec.deployedAt && !Number.isNaN(t.getTime()) ? t.toLocaleString() : '未知时间';
+        log.info(`本地有部署记录：${rec.host}（用户 ${rec.serverUser}，${when} 部署），正在检测是否已可免密连接（约几秒）...`);
+        const pre = verifyPasswordless({ user: rec.serverUser, host: target.host });
+        if (pre.ok) {
+          log.ok(`该服务器已可免密登录（ssh ${rec.serverUser}@${target.host}），跳过重复部署`);
+          already = { user: rec.serverUser, host: target.host };
+          break;
+        }
+        log.info('免密预检未通过，继续正常配对流程');
+      }
+    }
+
     // —— 配对码：临时码 6 位（一次性）；持久码 8 位（不轮换，可重复使用）——
     let code = null;
     for (let i = 0; i < 3; i++) {
@@ -430,11 +449,33 @@ async function roleClient() {
     if (pick === 'r' || pick === 'm') { skipDiscovery = false; continue; }
     return;
   }
+  // 免密预检通过：已可连接，未做任何部署，直接给出结论
+  if (already) {
+    log.plain('');
+    log.plain(`  ${c.green}${c.bold}✔ 配置完成！${c.reset} 已可免密连接，本次未重新部署  实测${c.green}✔${c.reset}`);
+    log.plain(`  测试命令：${c.cyan}ssh ${already.user}@${already.host}${c.reset}`);
+    log.plain('');
+    return;
+  }
   if (!done.ok) {
     log.error(`服务器部署存在失败步骤：${done.error || '详情见服务器端日志'}`);
     return;
   }
   log.ok(`服务器 ${done.serverHostname} 部署完成，目标用户：${done.serverUser}`);
+
+  // 保存部署记录：下次选择该服务器时先做免密预检，已可连接则跳过重复部署
+  try {
+    serverbook.upsert({
+      host: target.host,
+      serverUser: done.serverUser,
+      serverHostname: done.serverHostname,
+      fingerprint: fingerprintOf(pub.pubKey),
+      deployedAt: new Date().toISOString(),
+    });
+  } catch (e) {
+    log.warn(`部署记录保存失败（不影响本次使用）：${(e && e.message) || e}`);
+  }
+
   printAuditSummary(done.audit);
 
   // 更换 key 场景：清理服务器上的同主机旧公钥（凭配对签发的会话令牌鉴权）
