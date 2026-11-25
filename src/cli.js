@@ -9,6 +9,7 @@ const elevate = require('./elevate');
 const keygen = require('./keygen');
 const keymgr = require('./keymgr');
 const issue = require('./issue');
+const importer = require('./import');
 const install = require('./install');
 const { runDeploy } = require('./deploy');
 const { runAudit, runFix } = require('./audit');
@@ -141,11 +142,13 @@ function printAuditSummary(audit) {
 
 /* ---------------- [4] 密钥管理 ---------------- */
 
-/** 公钥类别标注：已颁发 → 本机客户端 → 外部配对（互斥，按优先级） */
+/** 公钥类别标注：已颁发 → 本机客户端 → 外部导入 → 外部配对（互斥，按优先级） */
 function keyTagOf(k, clientFp) {
   const issued = issue.issuedLabelOf(k.comment);
   if (issued) return { text: `已颁发→${issued}`, kind: 'issued' };
   if (clientFp && k.fingerprint && k.fingerprint === clientFp) return { text: '本机客户端', kind: 'client' };
+  const imported = importer.importedLabelOf(k.comment);
+  if (imported) return { text: `外部导入→${imported}`, kind: 'imported' };
   return { text: '外部配对', kind: 'remote' };
 }
 
@@ -167,7 +170,7 @@ function renderKeyManager() {
 
   // 服务端授权公钥（部署到本机的）
   log.plain(`  ${c.bold}── 服务端授权公钥（部署到本机的，本机作为服务端）──${c.reset}`);
-  log.plain(`  ${c.dim}标注说明：〔已颁发→标签〕本机颁发给其他设备  〔本机客户端〕本机身份公钥  〔外部配对〕其他电脑配对部署${c.reset}`);
+  log.plain(`  ${c.dim}标注说明：〔已颁发→标签〕本机颁发给其他设备  〔本机客户端〕本机身份公钥  〔外部导入→标签〕外部导入的公钥  〔外部配对〕其他电脑配对部署${c.reset}`);
   const groups = keymgr.listServerKeys();
   const entries = [];
   let n = 1;
@@ -255,8 +258,10 @@ async function keyMgrDelete(entries) {
   for (const e of picked) log.plain(`   - 〔${e.tag.text}〕(${e.label}) ${e.fingerprint}  ${e.comment}`);
   const hasClient = picked.some((e) => e.tag && e.tag.kind === 'client');
   const hasIssued = picked.some((e) => e.tag && e.tag.kind === 'issued');
+  const hasImported = picked.some((e) => e.tag && e.tag.kind === 'imported');
   if (hasClient) log.warn('选中项包含本机客户端密钥：删除后本机将无法免密连接所有已配对服务器（重新配对可恢复）');
   if (hasIssued) log.info('已颁发公钥删除即吊销对应设备的免密权限，该设备需重新颁发');
+  if (hasImported) log.info('外部导入公钥删除即吊销对应公钥的免密权限，需要时重新导入');
   const needAdmin = picked.some((e) => e.scope === 'admin');
   if (needAdmin && !env.isAdmin() && !(await requireAdmin())) return;
   const ans = await ask('确认删除？[y/N]: ');
@@ -721,6 +726,170 @@ async function roleIssue() {
   log.plain('');
 }
 
+/* ---------------- [6] 公钥导入 ---------------- */
+
+/** 多行粘贴收集：单独一行 . 结束（readline 多行粘贴会被逐行消费，需接管 line 事件） */
+function collectPaste() {
+  return new Promise((resolve) => {
+    log.plain(`${c.dim}每行一条公钥，空行自动忽略；粘贴完成后单独输入 . 回车结束：${c.reset}`);
+    const lines = [];
+    rl.setPrompt('> ');
+    rl.prompt();
+    const onLine = (chunk) => {
+      const t = String(chunk || '').trim();
+      if (t === '.') {
+        rl.removeListener('line', onLine);
+        resolve(lines);
+        return;
+      }
+      if (t) lines.push(t);
+      rl.prompt();
+    };
+    rl.on('line', onLine);
+  });
+}
+
+/** 公钥来源选择：返回 { keys, invalidLines, source }，取消返回 null */
+async function chooseImportSource() {
+  for (;;) {
+    log.plain(' 请选择公钥来源：');
+    log.plain('   [1] 粘贴文本  —— 直接粘贴公钥内容（每行一条，可一次粘贴多个）');
+    log.plain('   [2] 文件读取  —— 输入 .pub 或授权文件路径（可拖拽进来，支持含多个公钥）');
+    log.plain('   [0] 返回菜单');
+    const op = (await ask('请选择 [0-2]: ')).trim().toLowerCase();
+    if (op === '0' || op === 'q') return null;
+    if (op === '1') {
+      return { ...importer.parseKeysText((await collectPaste()).join('\n')), source: '粘贴文本' };
+    }
+    if (op === '2') {
+      for (let i = 0; i < 3; i++) {
+        const raw = await ask('请输入公钥文件路径（可带引号，如 "C:\\Users\\me\\Desktop\\id_ed25519.pub"）: ');
+        if (!raw.trim()) return null;
+        try {
+          const r = importer.readKeysFile(raw);
+          return { ...r, source: `文件 ${r.path}` };
+        } catch (e) {
+          log.warn(`文件不存在或不可读取："${importer.cleanPath(raw)}"（${(e && e.message) || e}），请重新输入`);
+        }
+      }
+      log.warn('多次输入无效，请重新选择来源');
+      continue;
+    }
+    log.warn('无效选项');
+  }
+}
+
+async function roleImport() {
+  const { user } = userInfo();
+  log.info(`当前用户：${user}（公钥导入模式：把外部已有的公钥部署到本机授权文件，即时生效）`);
+  if (!(await requireAdmin())) return;
+  if (!(await ensureSshInstalled())) return;
+
+  // 来源选择与解析：无有效公钥时可反复换来源，直至取得内容或主动返回
+  let parsed = null;
+  for (;;) {
+    parsed = await chooseImportSource();
+    if (!parsed) return;
+    if (parsed.keys.length) break;
+    log.warn(`未解析到有效公钥（${parsed.invalidLines.length} 行内容均无法识别，公钥需为单行：算法 + base64 + 可选注释）`);
+  }
+  if (parsed.invalidLines.length) {
+    log.warn(`${parsed.invalidLines.length} 行无效内容已跳过（公钥需为单行：算法 + base64 + 可选注释）`);
+  }
+  log.ok(`解析到 ${parsed.keys.length} 个有效公钥（来源：${parsed.source}）`);
+  parsed.keys.forEach((k, i) => {
+    k.tag = importer.detectTag(k.comment);
+    log.plain(`  [${i + 1}] ${k.algo}  ${c.cyan}${k.fingerprint || '(指纹无法计算)'}${c.reset}  ${k.comment || '(无注释)'}${k.tag ? `  ${c.dim}〔标签: ${k.tag}〕${c.reset}` : ''}`);
+  });
+
+  // 指纹预检：已存在于本机授权文件的跳过（避免同指纹不同注释产生重复条目）
+  const existing = new Set();
+  for (const g of keymgr.listServerKeys()) {
+    if (!g.exists || g.readable === false) continue;
+    for (const k of g.keys) if (k.fingerprint) existing.add(k.fingerprint);
+  }
+  const fresh = parsed.keys.filter((k) => !k.fingerprint || !existing.has(k.fingerprint));
+  const dup = parsed.keys.filter((k) => k.fingerprint && existing.has(k.fingerprint));
+  if (dup.length) {
+    log.warn('以下公钥已存在于本机授权文件，将自动跳过：');
+    for (const k of dup) log.plain(`   - ${k.algo}  ${k.fingerprint}  ${k.comment || '(无注释)'}`);
+  }
+  if (!fresh.length) {
+    log.warn('所有公钥均已部署，无需导入');
+    return;
+  }
+  log.info(`待导入 ${fresh.length} 个公钥`);
+
+  // 备注标签：优先自动识别公钥注释中已有的标签（#imported: 标记 / 末尾单标记），识别不到的再询问
+  const detected = fresh.map((k) => k.tag || null);
+  const detectedCount = detected.filter(Boolean).length;
+  const detectedNames = [...new Set(detected.filter(Boolean))];
+  let batchLabel = null;
+  if (detectedCount === fresh.length) {
+    log.ok(`已从公钥注释自动识别标签：${detectedNames.join('，')}`);
+  } else if (detectedCount === 0) {
+    batchLabel = await ask('请输入备注标签（可选，回车跳过；将写入注释 #imported:标签，便于在密钥管理中辨认与吊销）: ');
+  } else {
+    log.ok(`已自动识别 ${detectedCount}/${fresh.length} 个公钥的标签：${detectedNames.join('，')}`);
+    batchLabel = await ask(`请输入其余 ${fresh.length - detectedCount} 个公钥的备注标签（可选，回车跳过；已识别标签不受影响）: `);
+  }
+  const keyLines = fresh.map((k, i) => {
+    // 采用识别标签时移除原标签 token，避免注释重复（alis@DESKTOP-A phone → alis@DESKTOP-A #imported:phone）
+    const strip = detected[i] ? (k.comment.trim().split(/\s+/).pop() || '') : '';
+    return importer.attachImportedLabel(k.line, detected[i] || batchLabel, strip);
+  });
+
+  // 写入预告与确认
+  const adminGroup = env.isAdminGroup();
+  const paths = keymgr.authFilePaths();
+  log.plain('');
+  log.plain(`  即将导入 ${keyLines.length} 个公钥：`);
+  for (const line of keyLines) {
+    log.plain(`   - ${keymgr.algoName(line)}  ${c.cyan}${keymgr.fingerprint(line)}${c.reset}  ${keymgr.keyComment(line) || '(无注释)'}`);
+  }
+  log.plain('  写入文件：');
+  log.plain(`   - ${paths.user}`);
+  if (adminGroup) log.plain(`   - ${paths.admin}（管理员组用户）`);
+  log.info('无 sshd_config 变更时不重启服务，授权文件即时生效');
+  if (!confirmYes(await ask('确认导入？[Y/n]: '))) {
+    log.warn('已取消，未做任何改动');
+    return;
+  }
+
+  log.info('开始部署公钥（复用六步管线，授权文件即时生效）...');
+  const r = await runDeploy({ pubKeys: keyLines, skipRestart: true, onStep: (s) => log.step(s) });
+  if (!r.ok) {
+    log.error('部署存在失败步骤，详见上方日志');
+    return;
+  }
+  log.ok('部署完成');
+
+  log.info('开始配置体检（无连接，纯配置层检查）...');
+  const audit = await runAudit({ pubKeys: keyLines, onStep: (s) => log.step(s) });
+  printAuditSummary(audit);
+  const fixables = [...new Set(audit.checks.filter((x) => x.fixId && x.status !== 'OK' && x.status !== 'SKIP').map((x) => x.fixId))];
+  if (fixables.length) {
+    const ans = await ask('检测到可自动修复项，是否尝试修复？[y/N]: ');
+    if (confirmYes(ans, false)) {
+      for (const fixId of fixables) {
+        const res = await runFix(fixId);
+        log[res.ok ? 'ok' : 'error'](`修复 [${fixId}]：${res.msg}`);
+      }
+      log.info('重新体检...');
+      printAuditSummary(await runAudit({ pubKeys: keyLines, onStep: (s) => log.step(s) }));
+    }
+  }
+
+  log.plain('');
+  log.plain(`  ${c.green}${c.bold}✔ 导入完成！${c.reset} 部署${c.green}✔${c.reset} 体检${audit.ok ? c.green + '✔' : c.yellow + '!' + c.reset}`);
+  log.plain('  已导入公钥（即时生效，无需重启服务）：');
+  for (const line of keyLines) {
+    log.plain(`   - ${keymgr.algoName(line)}  ${keymgr.fingerprint(line)}  ${keymgr.keyComment(line) || '(无注释)'}`);
+  }
+  log.info('管理/吊销入口：[4] 密钥管理 → 〔外部导入→标签〕 → [d] 删除（即时生效，自动备份）');
+  log.plain('');
+}
+
 /* ---------------- 入口 ---------------- */
 
 function printMenu() {
@@ -730,21 +899,24 @@ function printMenu() {
   log.plain('   [3] 本机自连  —— 生成密钥并部署到本机（ssh localhost）');
   log.plain('   [4] 密钥管理  —— 客户端/服务端密钥查看、体检、删除、清空、备份');
   log.plain('   [5] 密钥颁发  —— 服务端为手机等设备生成专用密钥并部署，导出私钥自行导入');
+  log.plain('   [6] 公钥导入  —— 服务端导入外部已有公钥（粘贴/文件），部署到本机并生效');
   log.plain('   [0] 退出');
 }
 
 async function runRole(role) {
   if (role === 'server') await roleServer();
   else if (role === 'client') await roleClient();
+  else if (role === 'local') await roleLocal();
   else if (role === 'keys') await roleKeyMgr();
   else if (role === 'issue') await roleIssue();
+  else if (role === 'import') await roleImport();
   else await roleLocal();
 }
 
 async function main() {
   log.banner();
   const arg = (process.argv[2] || '').toLowerCase();
-  const role = { server: 'server', client: 'client', local: 'local', keys: 'keys', issue: 'issue' }[arg] || null;
+  const role = { server: 'server', client: 'client', local: 'local', keys: 'keys', issue: 'issue', import: 'import' }[arg] || null;
 
   // 显式传参：一次性执行，跑完退出（便于脚本调用）
   if (role) {
@@ -757,9 +929,9 @@ async function main() {
   // 交互模式：主菜单循环，子流程返回后回到菜单，[0] 退出
   for (;;) {
     printMenu();
-    const ans = (await ask('请选择 [0-5]: ')).trim().toLowerCase();
+    const ans = (await ask('请选择 [0-6]: ')).trim().toLowerCase();
     if (ans === '0' || ans === 'q') break;
-    const pick = { '1': 'server', '2': 'client', '3': 'local', '4': 'keys', '5': 'issue' }[ans];
+    const pick = { '1': 'server', '2': 'client', '3': 'local', '4': 'keys', '5': 'issue', '6': 'import' }[ans];
     if (!pick) {
       log.warn('无效选项，请重新选择');
       continue;

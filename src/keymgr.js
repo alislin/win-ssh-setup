@@ -215,12 +215,16 @@ function removeByFingerprints({ fingerprints, keepFingerprint, files }) {
 function scanStaleKeys({ clientHostname, currentFingerprint, files }) {
   const stale = [];
   if (!clientHostname) return stale;
+  // currentFingerprint 支持单个指纹或数组（批量部署时排除本批全部新 key）
+  const current = new Set(
+    (Array.isArray(currentFingerprint) ? currentFingerprint : [currentFingerprint]).filter(Boolean)
+  );
   const hostRe = new RegExp(`@${escapeRegExp(clientHostname)}(\\s|$)`, 'i');
   for (const file of files) {
     const parsed = parseKeyFile(file);
     if (!parsed.exists) continue;
     for (const k of parsed.keys) {
-      if (!k.fingerprint || k.fingerprint === currentFingerprint) continue;
+      if (!k.fingerprint || current.has(k.fingerprint)) continue;
       if (hostRe.test(k.comment)) {
         stale.push({ file, lineIndex: k.lineIndex, fingerprint: k.fingerprint, algo: k.algo, comment: k.comment });
       }

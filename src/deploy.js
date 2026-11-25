@@ -56,16 +56,36 @@ function patchConfig(original) {
 }
 
 /**
+ * 批量幂等追加公钥到授权文件，汇总新增/已存在数量。
+ * @returns {{status:'OK'|'SKIP', detail:string}} 有新增为 OK，全部已存在为 SKIP
+ */
+function appendKeysDedupe(file, keyLines) {
+  const added = [];
+  const skipped = [];
+  for (const line of keyLines) {
+    if (typeof appendKeyDedupe(file, line) === 'string') added.push(line);
+    else skipped.push(line);
+  }
+  const parts = [];
+  if (added.length) parts.push(`${added.length} 个新增`);
+  if (skipped.length) parts.push(`${skipped.length} 个已存在`);
+  return { status: added.length ? 'OK' : 'SKIP', detail: parts.join('，') || '无公钥可写入' };
+}
+
+/**
  * 六步部署管线（在服务器端提权环境执行，幂等可重复运行）。
  * @param {object} opts
- * @param {string} opts.pubKey 客户端公钥（单行）
+ * @param {string} [opts.pubKey] 客户端公钥（单行）
+ * @param {string[]} [opts.pubKeys] 批量公钥（导入模式，与 pubKey 二选一）
  * @param {string} [opts.clientHostname] 客户端主机名（用于同主机旧 key 识别）
- * @param {boolean} [opts.skipRestart] 颁发模式：授权文件即时生效，无 sshd_config 变更时跳过重启（避免打断现有 SSH 会话）
+ * @param {boolean} [opts.skipRestart] 颁发/导入模式：授权文件即时生效，无 sshd_config 变更时跳过重启（避免打断现有 SSH 会话）
  * @param {(step:{name:string,status:string,detail:string})=>void} [opts.onStep] 每步回调
  * @returns {Promise<{ok:boolean, steps:Array, userKeysPath:string, adminKeysPath:string|null, configBackup:string|null, staleKeys:Array}>}
  */
 async function runDeploy(opts = {}) {
-  const { pubKey, clientHostname, onStep, skipRestart } = opts;
+  const { pubKey, pubKeys, clientHostname, onStep, skipRestart } = opts;
+  const keyLines = (Array.isArray(pubKeys) ? pubKeys : [pubKey]).map((s) => String(s || '').trim()).filter(Boolean);
+  if (!keyLines.length) throw new Error('未提供公钥');
   const steps = [];
   let configBackup = null;
   let aborted = false;
@@ -84,18 +104,17 @@ async function runDeploy(opts = {}) {
     }
   };
 
-  const keyLine = pubKey.trim();
   const { home } = userInfo();
   const adminGroup = isAdminGroup();
   const userKeysPath = path.join(home, '.ssh', 'authorized_keys');
   const adminKeysPath = path.join(PROGRAM_DATA, 'ssh', 'administrators_authorized_keys');
   const configPath = path.join(PROGRAM_DATA, 'ssh', 'sshd_config');
 
-  await doStep('1/6 追加公钥到用户 authorized_keys', async () => appendKeyDedupe(userKeysPath, keyLine));
+  await doStep('1/6 追加公钥到用户 authorized_keys', async () => appendKeysDedupe(userKeysPath, keyLines));
 
   await doStep('2/6 追加公钥到管理员授权文件', async () => {
     if (!adminGroup) return { status: 'SKIP', detail: '当前用户不属于管理员组，无需' };
-    return appendKeyDedupe(adminKeysPath, keyLine);
+    return appendKeysDedupe(adminKeysPath, keyLines);
   });
 
   await doStep('3/6 收紧授权文件 ACL（仅 Administrators/SYSTEM）', async () => {
@@ -161,7 +180,7 @@ async function runDeploy(opts = {}) {
     const files = [userKeysPath, ...(adminGroup ? [adminKeysPath] : [])];
     staleKeys = scanStaleKeys({
       clientHostname,
-      currentFingerprint: fingerprint(keyLine),
+      currentFingerprint: keyLines.map(fingerprint),
       files,
     });
   }
